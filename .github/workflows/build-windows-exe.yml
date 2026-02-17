@@ -1,0 +1,71 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: client
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: |
+            client/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r client/requirements.txt
+
+      # Your code uses package-relative imports (e.g. from .ui.app import ...).
+      # This wrapper runs from the parent directory so the repo folder name
+      # (client/) is importable as a package.
+      - name: Create PyInstaller entrypoint wrapper
+        shell: pwsh
+        run: |
+          $outPath = "$env:GITHUB_WORKSPACE\build_entry.py"
+          Set-Content -Path $outPath -Encoding UTF8 -Value @(
+            'from client.main import main',
+            'raise SystemExit(main())'
+          )
+
+      - name: Build EXE (PyInstaller)
+        working-directory: "${{ github.workspace }}"
+        run: |
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name vc-app-client build_entry.py
+
+      - name: Package artifact
+        shell: pwsh
+        working-directory: "${{ github.workspace }}"
+        run: |
+          $exe = "dist\vc-app-client.exe"
+          if (-not (Test-Path $exe)) { throw "Expected EXE not found at $exe" }
+          Compress-Archive -Path $exe -DestinationPath vc-app-client-windows.zip -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vc-app-client-windows
+          path: |
+            ${{ github.workspace }}/vc-app-client-windows.zip
+
+      - name: Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ github.workspace }}/vc-app-client-windows.zip
