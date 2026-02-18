@@ -9,8 +9,8 @@ from typing import Any, Awaitable, Callable, Coroutine, Dict, Optional, cast
 
 from aiortc.rtcconfiguration import RTCConfiguration
 
-from ..net.signaling_client import SignalingClient
-from ..net.protocol import IceCandidateDict
+from net.signaling_client import SignalingClient
+from net.protocol import IceCandidateDict
 from .audio import AudioActivityConfig, AudioDevice, LocalAudio
 from .webrtc_peer import PeerCallbacks, WebRTCPeer
 

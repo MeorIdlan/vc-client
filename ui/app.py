@@ -10,9 +10,9 @@ from concurrent.futures import Future
 
 from PySide6 import QtCore, QtWidgets
 
-from ..net.signaling_client import SignalingCallbacks, SignalingClient
-from ..rtc.audio import AudioDevice, list_audio_inputs, list_audio_outputs
-from ..rtc.peer_manager import ManagerCallbacks, PeerManager
+from net.signaling_client import SignalingCallbacks, SignalingClient
+from rtc.audio import AudioDevice, list_audio_inputs, list_audio_outputs
+from rtc.peer_manager import ManagerCallbacks, PeerManager
 from .windows import MainWindow
 
 

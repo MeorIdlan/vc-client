@@ -4,10 +4,24 @@ import argparse
 import os
 import sys
 
-from .logging_config import setup_logging
+from logging_config import setup_logging
+
+
+def _load_dotenv() -> None:
+	try:
+		from dotenv import load_dotenv  # type: ignore
+	except Exception:
+		return
+	try:
+		# Do not override real environment variables.
+		load_dotenv(override=False)
+	except Exception:
+		return
 
 
 def main(argv: list[str] | None = None) -> int:
+	_load_dotenv()
+
 	parser = argparse.ArgumentParser(description="vc-app client")
 	parser.add_argument(
 		"--log-level",
@@ -34,7 +48,7 @@ def main(argv: list[str] | None = None) -> int:
 	setup_logging(args.log_level)
 
 	try:
-		from .ui.app import AppConfig, VCClientApp, create_qt_app
+		from ui.app import AppConfig, VCClientApp, create_qt_app
 	except Exception as e:
 		print(f"Failed to import UI dependencies: {e}")
 		print("Install client deps with: pip install -r client/requirements.txt")

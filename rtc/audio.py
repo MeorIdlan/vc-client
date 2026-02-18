@@ -1,7 +1,7 @@
 """Audio helpers for aiortc.
 
 MVP scope:
-- Create a local microphone audio track (best-effort on Linux).
+- Create a local microphone audio track (best-effort on Windows).
 - Provide a best-effort sink for remote audio (playback if possible, else discard).
 """
 
@@ -38,6 +38,32 @@ except Exception:  # pragma: no cover
 
 
 logger = logging.getLogger(__name__)
+
+
+def _env_truthy(name: str) -> bool:
+	v = os.environ.get(name, "").strip().casefold()
+	return v in {"1", "true", "yes", "on"}
+
+
+def _audio_enum_log_enabled() -> bool:
+	# Enable automatically when debug logging is on, or force via env var.
+	return logger.isEnabledFor(logging.DEBUG) or _env_truthy("VC_AUDIO_DEVICE_ENUM_LOG")
+
+
+def _audio_enum_log(msg: str, *args: object) -> None:
+	if not _audio_enum_log_enabled():
+		return
+	# If explicitly enabled via env var, emit at INFO so it shows even when the
+	# app isn't running with debug logs.
+	if _env_truthy("VC_AUDIO_DEVICE_ENUM_LOG") and not logger.isEnabledFor(logging.DEBUG):
+		logger.info(msg, *args)
+	else:
+		logger.debug(msg, *args)
+
+
+def _audio_enum_dump_enabled() -> bool:
+	# Separate switch because device dumps can be quite noisy.
+	return _env_truthy("VC_AUDIO_DEVICE_ENUM_DUMP")
 
 
 def _env_int(name: str, default: int) -> int:
@@ -245,116 +271,322 @@ def _is_windows() -> bool:
 	return sys.platform.startswith("win")
 
 
-def _is_redundant_windows_audio_device_name(name: str) -> bool:
-	"""Return True for Windows pseudo-devices that duplicate system default.
-
-	PortAudio (and therefore sounddevice) often exposes non-physical devices like
-	"Microsoft Sound Mapper" and "Primary Sound * Driver" which are effectively
-	aliases for the system default device.
-	"""
-	n = (name or "").strip().casefold()
-	if not n:
-		return True
-	return (
-		"microsoft sound mapper" in n
-		or "primary sound capture driver" in n
-		or "primary sound driver" in n
-		or "primary sound playback driver" in n
-	)
-
-
-_SD_HOSTAPI_SUFFIX_RE = re.compile(
-	r"\s*(?:\(|,|-)\s*(wasapi|mme|directsound|wdm-ks|wdm ks)\s*\)?\s*$",
+_LOOPBACK_SUFFIX_RE = re.compile(r"\s*\(\s*loopback\s*\)\s*$", re.IGNORECASE)
+_END_PAREN_RE = re.compile(r"\(([^()]*)\)\s*$")
+_WINDOWS_ENDPOINT_PREFIX_RE = re.compile(
+	r"^(?:speakers|headphones|microphone|headset microphone|line|digital output)\b\s*",
 	re.IGNORECASE,
 )
 
 
-def _normalize_sounddevice_name(name: str) -> str:
-	"""Normalize a sounddevice/PortAudio name for duplicate-collapsing.
+def _normalize_device_name_for_dedupe(name: str) -> str:
+	"""Normalize endpoint names for dedupe and cross-library matching."""
+	s = (name or "").strip()
+	s = _LOOPBACK_SUFFIX_RE.sub("", s).strip()
+	s = re.sub(r"\s+", " ", s)
+	return s.casefold()
 
-	Some PortAudio builds include host API markers in the device name, which can
-	get truncated in the UI and appear as duplicates.
+
+def _device_match_keys(name: str) -> set[str]:
+	"""Return a set of normalized keys for cross-library matching.
+
+	SoundCard and PortAudio sometimes label the same endpoint differently
+	(e.g. "Speakers (...)" vs "Headphones (...)"), so we generate a few keys.
 	"""
-	base = (name or "").strip()
-	base = _SD_HOSTAPI_SUFFIX_RE.sub("", base).strip()
-	return base
+	norm = _normalize_device_name_for_dedupe(name)
+	keys: set[str] = set()
+	if norm:
+		keys.add(norm)
+		# Strip common Windows direction/prefix words.
+		stripped = _WINDOWS_ENDPOINT_PREFIX_RE.sub("", norm).strip()
+		if stripped and stripped != norm:
+			keys.add(stripped)
+		# Add the last parenthetical section as a key, which often contains the
+		# stable product name.
+		m = _END_PAREN_RE.search(norm)
+		if m:
+			paren = _normalize_device_name_for_dedupe(m.group(1))
+			if paren:
+				keys.add(paren)
+	return keys
 
 
-def _hostapi_preference_rank(hostapi_name: str) -> int:
-	"""Lower is better."""
-	n = (hostapi_name or "").strip().casefold()
-	order = ["wasapi", "wdm-ks", "wdm ks", "directsound", "mme"]
-	for i, token in enumerate(order):
-		if token in n:
-			return i
-	return 999
+@dataclass(frozen=True)
+class _EndpointCandidate:
+	index: int
+	name: str
+	normalized: str
+	channels: int
+	default_samplerate: float
 
 
-def _list_sounddevice_devices(*, want: str) -> list[AudioDevice]:
-	"""Enumerate Windows devices via sounddevice, collapsing host-API duplicates.
-
-	`want` is "input" or "output".
-	"""
+def _sounddevice_wasapi_hostapi_indices() -> set[int]:
+	"""Return PortAudio host API indices for WASAPI."""
 	if sd is None:
-		return []
-
+		return set()
 	try:
 		hostapis = sd.query_hostapis()  # type: ignore[attr-defined]
-		hostapi_names = {i: str(h.get("name", "")) for i, h in enumerate(hostapis)}
 	except Exception:
-		hostapi_names = {}
+		return set()
+	if _audio_enum_dump_enabled():
+		try:
+			for i, h in enumerate(hostapis):
+				_audio_enum_log("audio enum hostapi idx=%s name=%s", i, str(h.get("name", "") or ""))
+		except Exception:
+			pass
+	indices: set[int] = set()
+	for i, h in enumerate(hostapis):
+		try:
+			name = str(h.get("name", "") or "")
+		except Exception:
+			name = ""
+		if "wasapi" in name.casefold():
+			indices.add(int(i))
+	return indices
 
+
+def _collect_wasapi_candidates(*, direction: str) -> list[_EndpointCandidate]:
+	"""(1)(2) Enumerate sounddevice devices, restricted to WASAPI and direction."""
+	if sd is None:
+		return []
+	allowed_hostapis = _sounddevice_wasapi_hostapi_indices()
+	_audio_enum_log(
+		"audio enum start direction=%s allowed_wasapi_hostapis=%s",
+		direction,
+		sorted(allowed_hostapis),
+	)
+	if not allowed_hostapis:
+		return []
+
+	expected_key = "max_input_channels" if direction == "input" else "max_output_channels"
 	try:
-		raw = list(sd.query_devices())
+		devices = list(sd.query_devices())
 	except Exception:
 		return []
 
-	# Collect candidates (base_name -> list of (rank, idx, label))
-	groups: dict[str, list[tuple[int, int, str]]] = {}
-	for idx, dev in enumerate(raw):
+	if _audio_enum_dump_enabled():
 		try:
-			max_in = int(dev.get("max_input_channels", 0))
-			max_out = int(dev.get("max_output_channels", 0))
+			hostapis = sd.query_hostapis()  # type: ignore[attr-defined]
+			hostapi_names = {i: str(h.get("name", "") or "") for i, h in enumerate(hostapis)}
+		except Exception:
+			hostapi_names = {}
+		for idx, dev in enumerate(devices):
+			try:
+				name = str(dev.get("name", "") or "").strip()
+				hostapi_idx = int(dev.get("hostapi", -1))
+				in_ch = int(dev.get("max_input_channels", 0) or 0)
+				out_ch = int(dev.get("max_output_channels", 0) or 0)
+				sr = float(dev.get("default_samplerate", 0.0) or 0.0)
+			except Exception:
+				continue
+			_audio_enum_log(
+				"audio enum dev idx=%s hostapi=%s(%s) in=%s out=%s sr=%s name=%s",
+				idx,
+				hostapi_idx,
+				hostapi_names.get(hostapi_idx, ""),
+				in_ch,
+				out_ch,
+				sr,
+				name,
+			)
+
+	candidates: list[_EndpointCandidate] = []
+	for idx, dev in enumerate(devices):
+		try:
+			hostapi_idx = int(dev.get("hostapi", -1))
+			channels = int(dev.get(expected_key, 0) or 0)
+			name = str(dev.get("name", "") or "").strip()
+			default_sr = float(dev.get("default_samplerate", 0.0) or 0.0)
 		except Exception:
 			continue
-		if want == "input" and max_in <= 0:
-			continue
-		if want == "output" and max_out <= 0:
-			continue
 
-		name = str(dev.get("name", f"Device {idx}"))
-		if _is_redundant_windows_audio_device_name(name):
+		if hostapi_idx not in allowed_hostapis:
+			if _audio_enum_dump_enabled() and name:
+				_audio_enum_log(
+					"audio enum skip_non_wasapi direction=%s idx=%s hostapi=%s name=%s",
+					direction,
+					idx,
+					hostapi_idx,
+					name,
+				)
 			continue
-
-		base = _normalize_sounddevice_name(name)
-		if not base:
+		if channels <= 0:
+			if _audio_enum_dump_enabled() and name:
+				_audio_enum_log(
+					"audio enum skip_no_channels direction=%s idx=%s name=%s",
+					direction,
+					idx,
+					name,
+				)
 			continue
+		if not name:
+			continue
+		norm = _normalize_device_name_for_dedupe(name)
+		if not norm:
+			continue
+		candidates.append(
+			_EndpointCandidate(
+				index=int(idx),
+				name=name,
+				normalized=norm,
+				channels=int(channels),
+				default_samplerate=float(default_sr),
+			)
+		)
 
-		hostapi_idx = dev.get("hostapi", None)
-		if hostapi_idx is None:
-			hostapi_name = ""
+	_audio_enum_log("audio enum raw_candidates=%s", len(candidates))
+	return candidates
+
+
+def _dedupe_candidates(candidates: list[_EndpointCandidate]) -> list[_EndpointCandidate]:
+	"""(3) Dedupe within WASAPI by normalized name, choosing the best candidate."""
+	best_by_norm: dict[str, _EndpointCandidate] = {}
+	for c in candidates:
+		prev = best_by_norm.get(c.normalized)
+		if prev is None or (c.channels, c.default_samplerate, -c.index) > (
+			prev.channels,
+			prev.default_samplerate,
+			-prev.index,
+		):
+			best_by_norm[c.normalized] = c
+	selected = list(best_by_norm.values())
+	selected.sort(key=lambda x: x.name.casefold())
+	_audio_enum_log("audio enum deduped=%s", len(selected))
+	return selected
+
+
+def _is_openable(*, candidate: _EndpointCandidate, direction: str) -> bool:
+	"""(4) Drop devices PortAudio reports as unopenable."""
+	if sd is None:
+		return False
+	sd_mod = cast(Any, sd)
+
+	def _check(sr: float) -> bool:
+		try:
+			samplerate = float(sr)
+			if samplerate <= 0:
+				samplerate = None  # type: ignore[assignment]
+			dtype = "int16"
+			if direction == "input":
+				test_channels = 1
+				sd_mod.check_input_settings(
+					device=candidate.index,
+					channels=test_channels,
+					samplerate=samplerate,
+					dtype=dtype,
+				)
+			else:
+				test_channels = 2 if candidate.channels >= 2 else 1
+				sd_mod.check_output_settings(
+					device=candidate.index,
+					channels=test_channels,
+					samplerate=samplerate,
+					dtype=dtype,
+				)
+			return True
+		except Exception:
+			return False
+
+	# Prefer 48kHz for the app; fall back to the device default.
+	return _check(48000.0) or _check(candidate.default_samplerate)
+
+
+def _filter_openable(candidates: list[_EndpointCandidate], *, direction: str) -> list[_EndpointCandidate]:
+	openable: list[_EndpointCandidate] = []
+	for c in candidates:
+		if _is_openable(candidate=c, direction=direction):
+			openable.append(c)
 		else:
-			try:
-				hostapi_name = str(hostapi_names.get(int(hostapi_idx), ""))
-			except Exception:
-				hostapi_name = ""
-		rank = _hostapi_preference_rank(hostapi_name)
-		groups.setdefault(base, []).append((rank, idx, name))
+			_audio_enum_log("audio enum drop_unopenable idx=%s name=%s", c.index, c.name)
+	_audio_enum_log("audio enum openable=%s", len(openable))
+	return openable
 
-	# Pick best host API per base name
-	selected: list[tuple[str, int]] = []
-	for base, items in groups.items():
-		# Choose a single best entry per base device name.
-		# This collapses duplicates that occur across host APIs and prevents
-		# UI truncation from making distinct strings look identical.
-		rank, idx, _label = min(items, key=lambda t: (t[0], t[1]))
-		selected.append((base, idx))
 
-	devices: list[AudioDevice] = [AudioDevice(backend="sounddevice", device="default", label="System default")]
-	for base, idx in sorted(selected, key=lambda t: t[1]):
-		devices.append(AudioDevice(backend="sounddevice", device=idx, label=base))
+def _soundcard_active_endpoint_keys(*, direction: str) -> set[str]:
+	"""(5) Active Windows endpoints (plugged in / enabled) via SoundCard."""
+	if not _is_windows():
+		return set()
+	try:
+		import soundcard as sc  # type: ignore
+	except Exception:
+		if _audio_enum_dump_enabled():
+			_audio_enum_log("audio enum soundcard import failed direction=%s", direction)
+		return set()
 
-	return devices
+	try:
+		endpoints = sc.all_microphones() if direction == "input" else sc.all_speakers()
+	except Exception:
+		return set()
+
+	keys: set[str] = set()
+	for e in endpoints:
+		try:
+			name = str(getattr(e, "name", "") or "")
+		except Exception:
+			name = ""
+		keys.update(_device_match_keys(name))
+	_audio_enum_log("audio enum soundcard active_%s keys=%s", direction, len(keys))
+	return keys
+
+
+
+def _matches_active(candidate_name: str, active_keys: set[str]) -> bool:
+	if not active_keys:
+		return True
+	ck = _device_match_keys(candidate_name)
+	if ck & active_keys:
+		return True
+	# Fallback fuzzy match across keys.
+	for c in ck:
+		for a in active_keys:
+			if c and a and (c in a or a in c):
+				return True
+	return False
+
+
+def _filter_active_endpoints(candidates: list[_EndpointCandidate], *, direction: str) -> list[_EndpointCandidate]:
+	active_keys = _soundcard_active_endpoint_keys(direction=direction)
+	if not active_keys:
+		return candidates
+	filtered: list[_EndpointCandidate] = []
+	dropped: list[_EndpointCandidate] = []
+	for c in candidates:
+		if _matches_active(c.name, active_keys):
+			filtered.append(c)
+		else:
+			dropped.append(c)
+	if not filtered and candidates:
+		_audio_enum_log("audio enum active_filter empty; keeping unfiltered")
+		return candidates
+	if dropped:
+		_audio_enum_log("audio enum active_filter dropped=%s", len(dropped))
+		for d in dropped:
+			_audio_enum_log("audio enum drop_inactive idx=%s name=%s", d.index, d.name)
+	_audio_enum_log("audio enum active_filtered=%s", len(filtered))
+	return filtered
+
+
+def _pick_default_candidate(candidates: list[_EndpointCandidate], *, direction: str) -> Optional[_EndpointCandidate]:
+	"""Pick a default candidate for the 'System default' entry."""
+	if not candidates:
+		return None
+
+	# Prefer SoundCard default endpoint when available.
+	default_norm: Optional[str] = None
+	if _is_windows():
+		try:
+			import soundcard as sc  # type: ignore
+			ep = sc.default_microphone() if direction == "input" else sc.default_speaker()
+			default_norm = _normalize_device_name_for_dedupe(str(getattr(ep, "name", "") or ""))
+		except Exception:
+			default_norm = None
+	if default_norm:
+		for c in candidates:
+			if _matches_active(c.name, _device_match_keys(default_norm)):
+				return c
+
+	# Else: best overall (more channels, higher samplerate).
+	return max(candidates, key=lambda x: (int(x.channels), float(x.default_samplerate), -int(x.index)))
 
 
 class SoundDeviceAudioTrack(MediaStreamTrack):
@@ -444,136 +676,70 @@ class SoundDeviceAudioTrack(MediaStreamTrack):
 			super().stop()
 
 
-def _run_cmd_lines(argv: list[str], timeout_sec: float = 0.8) -> list[str]:
-	try:
-		p = subprocess.run(
-			argv,
-			check=False,
-			stdout=subprocess.PIPE,
-			stderr=subprocess.DEVNULL,
-			text=True,
-			timeout=timeout_sec,
-		)
-	except Exception:
-		return []
-	if not p.stdout:
-		return []
-	# Preserve leading whitespace so callers can distinguish indented
-	# commentary lines (e.g. `arecord -L` / `aplay -L`).
-	lines: list[str] = []
-	for ln in p.stdout.splitlines():
-		if not ln.strip():
-			continue
-		lines.append(ln.rstrip("\r\n"))
-	return lines
-
-
-def _pactl_default(kind: str) -> Optional[str]:
-	"""Return PulseAudio default source/sink name, if available."""
-	# kind: "Source" or "Sink"
-	if shutil.which("pactl") is None:
-		return None
-	for ln in _run_cmd_lines(["pactl", "info"], timeout_sec=0.8):
-		prefix = f"Default {kind}:"
-		if ln.startswith(prefix):
-			value = ln[len(prefix) :].strip()
-			return value or None
-	return None
-
-
-def _dedupe_audio_devices(devices: list[AudioDevice]) -> list[AudioDevice]:
-	"""Return devices with duplicates removed, preserving order.
-
-	On Windows, PortAudio may expose the same physical device multiple times under
-	different host APIs (MME/WASAPI/WDM-KS), often with identical names.
-	"""
-	seen: set[tuple[str, str]] = set()
-	result: list[AudioDevice] = []
-	for d in devices:
-		# Dedupe by backend+device id; Windows sounddevice duplicates are handled
-		# during enumeration (host API preference).
-		key = (d.backend, str(d.device))
-		if key in seen:
-			continue
-		seen.add(key)
-		result.append(d)
-	return result
-
-
 def list_audio_inputs() -> list[AudioDevice]:
-	"""Best-effort list of microphone capture devices."""
+	"""List microphone capture devices.
+
+	Windows-only discovery: WASAPI-only via sounddevice + soundcard active endpoints.
+	"""
+	_audio_enum_log("audio enum inputs start os=%s is_windows=%s", platform.system(), _is_windows())
+	if not _is_windows() or sd is None:
+		# Non-Windows is out of scope for this app.
+		return [AudioDevice(backend="sounddevice", device="default", label="System default")]
+
+	cands = _collect_wasapi_candidates(direction="input")
+	cands = _dedupe_candidates(cands)
+	cands = _filter_openable(cands, direction="input")
+	cands = _filter_active_endpoints(cands, direction="input")
+
+	default_cand = _pick_default_candidate(cands, direction="input")
 	devices: list[AudioDevice] = []
+	if default_cand is not None:
+		# Keep the system default entry but also retain the named device so
+		# explicit devices (e.g. Razer) aren't hidden behind the "System default" label.
+		devices.append(AudioDevice(backend="sounddevice", device=default_cand.index, label="System default"))
+	else:
+		# If WASAPI isn't available for some reason, keep a fallback entry.
+		devices.append(AudioDevice(backend="sounddevice", device="default", label="System default"))
 
-	# Windows-first: PortAudio device list
-	if _is_windows() and sd is not None:
-		try:
-			return _dedupe_audio_devices(_list_sounddevice_devices(want="input"))
-		except Exception:
-			# Fall through to linux probing.
-			pass
+	for c in cands:
+		devices.append(AudioDevice(backend="sounddevice", device=c.index, label=c.name))
 
-	# PulseAudio / PipeWire Pulse compatibility
-	if shutil.which("pactl") is not None:
-		default_src = _pactl_default("Source")
-		for ln in _run_cmd_lines(["pactl", "list", "short", "sources"], timeout_sec=1.2):
-			parts = ln.split()  # index, name, driver, ...
-			if len(parts) >= 2:
-				name = parts[1]
-				label = name
-				if default_src and name == default_src:
-					label = f"{name} (default)"
-				devices.append(AudioDevice(backend="pulse", device=name, label=label))
-
-	# ALSA fallback
-	if shutil.which("arecord") is not None:
-		for ln in _run_cmd_lines(["arecord", "-L"], timeout_sec=1.2):
-			# arecord -L includes commentary lines; device ids are non-indented
-			if ln.startswith(" ") or ln.startswith("\t"):
-				continue
-			name = ln.strip()
-			if not name:
-				continue
-			devices.append(AudioDevice(backend="alsa", device=name, label=name))
-
-	# Always allow "default" as a safe option.
-	if not any(d.backend == "pulse" and d.device == "default" for d in devices):
-		devices.insert(0, AudioDevice(backend="pulse", device="default", label="System default"))
-	return _dedupe_audio_devices(devices)
+	_audio_enum_log("audio enum inputs final_count=%s", len(devices))
+	for d in devices:
+		_audio_enum_log("audio enum inputs final backend=%s device=%s label=%s", d.backend, d.device, d.label)
+	return devices
 
 
 def list_audio_outputs() -> list[AudioDevice]:
-	"""Best-effort list of speaker/headphone output devices."""
+	"""List speaker/headphone output devices.
+
+	Windows-only discovery: WASAPI-only via sounddevice + soundcard active endpoints.
+	"""
+	_audio_enum_log("audio enum outputs start os=%s is_windows=%s", platform.system(), _is_windows())
+	if not _is_windows() or sd is None:
+		return [AudioDevice(backend="sounddevice", device="default", label="System default")]
+
+	cands = _collect_wasapi_candidates(direction="output")
+	cands = _dedupe_candidates(cands)
+	cands = _filter_openable(cands, direction="output")
+	cands = _filter_active_endpoints(cands, direction="output")
+
+	default_cand = _pick_default_candidate(cands, direction="output")
 	devices: list[AudioDevice] = []
+	if default_cand is not None:
+		# Keep the system default entry but also retain the named device so
+		# explicit devices (e.g. Razer) aren't hidden behind the "System default" label.
+		devices.append(AudioDevice(backend="sounddevice", device=default_cand.index, label="System default"))
+	else:
+		devices.append(AudioDevice(backend="sounddevice", device="default", label="System default"))
 
-	if _is_windows() and sd is not None:
-		try:
-			return _dedupe_audio_devices(_list_sounddevice_devices(want="output"))
-		except Exception:
-			pass
+	for c in cands:
+		devices.append(AudioDevice(backend="sounddevice", device=c.index, label=c.name))
 
-	if shutil.which("pactl") is not None:
-		default_sink = _pactl_default("Sink")
-		for ln in _run_cmd_lines(["pactl", "list", "short", "sinks"], timeout_sec=1.2):
-			parts = ln.split()
-			if len(parts) >= 2:
-				name = parts[1]
-				label = name
-				if default_sink and name == default_sink:
-					label = f"{name} (default)"
-				devices.append(AudioDevice(backend="pulse", device=name, label=label))
-
-	if shutil.which("aplay") is not None:
-		for ln in _run_cmd_lines(["aplay", "-L"], timeout_sec=1.2):
-			if ln.startswith(" ") or ln.startswith("\t"):
-				continue
-			name = ln.strip()
-			if not name:
-				continue
-			devices.append(AudioDevice(backend="alsa", device=name, label=name))
-
-	if not any(d.backend == "pulse" and d.device == "default" for d in devices):
-		devices.insert(0, AudioDevice(backend="pulse", device="default", label="System default"))
-	return _dedupe_audio_devices(devices)
+	_audio_enum_log("audio enum outputs final_count=%s", len(devices))
+	for d in devices:
+		_audio_enum_log("audio enum outputs final backend=%s device=%s label=%s", d.backend, d.device, d.label)
+	return devices
 
 
 def _try_create_player(preferred: Optional[AudioDevice] = None) -> Tuple[Optional[MediaPlayer], Optional[str]]:
