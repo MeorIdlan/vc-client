@@ -244,6 +244,24 @@ def _is_windows() -> bool:
 	return sys.platform.startswith("win")
 
 
+def _is_redundant_windows_audio_device_name(name: str) -> bool:
+	"""Return True for Windows pseudo-devices that duplicate system default.
+
+	PortAudio (and therefore sounddevice) often exposes non-physical devices like
+	"Microsoft Sound Mapper" and "Primary Sound * Driver" which are effectively
+	aliases for the system default device.
+	"""
+	n = (name or "").strip().casefold()
+	if not n:
+		return True
+	return (
+		"microsoft sound mapper" in n
+		or "primary sound capture driver" in n
+		or "primary sound driver" in n
+		or "primary sound playback driver" in n
+	)
+
+
 class SoundDeviceAudioTrack(MediaStreamTrack):
 	kind = "audio"
 
@@ -405,6 +423,8 @@ def list_audio_inputs() -> list[AudioDevice]:
 				except Exception:
 					continue
 				name = str(dev.get("name", f"Device {idx}"))
+				if _is_redundant_windows_audio_device_name(name):
+					continue
 				devices.append(AudioDevice(backend="sounddevice", device=idx, label=name))
 				return _dedupe_audio_devices(devices)
 		except Exception:
@@ -454,6 +474,8 @@ def list_audio_outputs() -> list[AudioDevice]:
 				except Exception:
 					continue
 				name = str(dev.get("name", f"Device {idx}"))
+				if _is_redundant_windows_audio_device_name(name):
+					continue
 				devices.append(AudioDevice(backend="sounddevice", device=idx, label=name))
 				return _dedupe_audio_devices(devices)
 		except Exception:
