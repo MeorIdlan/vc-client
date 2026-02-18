@@ -342,26 +342,17 @@ def _list_sounddevice_devices(*, want: str) -> list[AudioDevice]:
 		groups.setdefault(base, []).append((rank, idx, name))
 
 	# Pick best host API per base name
-	selected: list[tuple[str, int, str]] = []
+	selected: list[tuple[str, int]] = []
 	for base, items in groups.items():
-		items_sorted = sorted(items, key=lambda t: (t[0], t[1]))
-		best_rank = items_sorted[0][0]
-		# Keep only items from the best host API rank for this name.
-		best = [(idx, label) for (rank, idx, label) in items_sorted if rank == best_rank]
-		for idx, label in best:
-			selected.append((base, idx, label))
-
-	# If multiple selected share same base name, disambiguate label.
-	base_counts: dict[str, int] = {}
-	for base, _idx, _label in selected:
-		base_counts[base] = base_counts.get(base, 0) + 1
+		# Choose a single best entry per base device name.
+		# This collapses duplicates that occur across host APIs and prevents
+		# UI truncation from making distinct strings look identical.
+		rank, idx, _label = min(items, key=lambda t: (t[0], t[1]))
+		selected.append((base, idx))
 
 	devices: list[AudioDevice] = [AudioDevice(backend="sounddevice", device="default", label="System default")]
-	for base, idx, label in sorted(selected, key=lambda t: t[1]):
-		final_label = label
-		if base_counts.get(base, 0) > 1:
-			final_label = f"{base} (id {idx})"
-		devices.append(AudioDevice(backend="sounddevice", device=idx, label=final_label))
+	for base, idx in sorted(selected, key=lambda t: t[1]):
+		devices.append(AudioDevice(backend="sounddevice", device=idx, label=base))
 
 	return devices
 
