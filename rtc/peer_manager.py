@@ -11,7 +11,7 @@ from aiortc.rtcconfiguration import RTCConfiguration
 
 from ..net.signaling_client import SignalingClient
 from ..net.protocol import IceCandidateDict
-from .audio import AudioDevice, LocalAudio
+from .audio import AudioActivityConfig, AudioDevice, LocalAudio
 from .webrtc_peer import PeerCallbacks, WebRTCPeer
 
 
@@ -37,10 +37,31 @@ class PeerManager:
         self._peers: Dict[str, WebRTCPeer] = {}
         self._preferred_input: Optional[AudioDevice] = None
         self._preferred_output: Optional[AudioDevice] = None
-        self._local_audio = LocalAudio.create(self._preferred_input)
+        self._audio_activity_config = AudioActivityConfig.from_env()
+        self._local_audio = LocalAudio.create(self._preferred_input, activity_config=self._audio_activity_config)
         self._rtc_config: Optional[RTCConfiguration] = None
 
         self._lock = asyncio.Lock()
+
+    @property
+    def audio_activity_config(self) -> AudioActivityConfig:
+        return self._audio_activity_config
+
+    async def set_audio_activity_threshold(self, rms_start: int) -> None:
+        """Update the audio activity detection threshold.
+
+        Uses hysteresis: stop is kept below start to avoid flicker.
+        """
+
+        start = max(0, int(rms_start))
+        stop = int(start * 0.66)
+        if stop >= start:
+            stop = max(0, start - 1)
+
+        async with self._lock:
+            self._audio_activity_config.rms_start = start
+            self._audio_activity_config.rms_stop = stop
+        logger.info("rtc audio activity threshold updated start=%s stop=%s", start, stop)
 
     async def set_audio_devices(self, *, input_device: Optional[AudioDevice], output_device: Optional[AudioDevice]) -> None:
         """Set preferred audio devices for future tracks.
@@ -54,7 +75,7 @@ class PeerManager:
             self._preferred_output = output_device
 
             old = self._local_audio
-            self._local_audio = LocalAudio.create(self._preferred_input)
+            self._local_audio = LocalAudio.create(self._preferred_input, activity_config=self._audio_activity_config)
 
         try:
             old.close()
@@ -138,6 +159,7 @@ class PeerManager:
                 peer_id=peer_id,
                 local_audio_track=self._local_audio.track,
                 preferred_output=self._preferred_output,
+                audio_activity_config=self._audio_activity_config,
                 callbacks=cb,
                 rtc_config=self._rtc_config,
             )

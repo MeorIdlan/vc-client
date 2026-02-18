@@ -13,7 +13,7 @@ from aiortc import (
 from aiortc.rtcconfiguration import RTCConfiguration
 from aiortc.sdp import candidate_from_sdp, candidate_to_sdp
 
-from .audio import AudioDevice, RemoteAudioSink
+from .audio import AudioActivityConfig, AudioDevice, RemoteAudioSink, wrap_with_audio_activity_log
 
 
 AsyncPeerCallback = Callable[..., Awaitable[None]]
@@ -50,6 +50,7 @@ class WebRTCPeer:
         peer_id: str,
         local_audio_track,
         preferred_output: Optional[AudioDevice] = None,
+        audio_activity_config: Optional[AudioActivityConfig] = None,
         callbacks: Optional[PeerCallbacks] = None,
         rtc_config: Optional[RTCConfiguration] = None,
     ):
@@ -59,6 +60,7 @@ class WebRTCPeer:
 
         self._remote_sink: Optional[RemoteAudioSink] = None
         self._preferred_output = preferred_output
+        self._audio_activity_config = audio_activity_config
         self._closed = False
 
         if local_audio_track is not None:
@@ -84,7 +86,13 @@ class WebRTCPeer:
             await self._log(f"pc[{self.peer_id}] remote track kind={track.kind}")
             if track.kind == "audio":
                 self._remote_sink = RemoteAudioSink(output=self._preferred_output)
-                await self._remote_sink.start(track)
+
+                wrapped = wrap_with_audio_activity_log(
+                    track,
+                    label=f"RX peer={self.peer_id}",
+                    config=self._audio_activity_config,
+                )
+                await self._remote_sink.start(wrapped or track)
 
     async def close(self) -> None:
         if self._closed:

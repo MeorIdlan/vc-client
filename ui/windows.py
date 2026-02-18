@@ -28,6 +28,10 @@ class MainWindow(QtWidgets.QMainWindow):
 		self.room_edit.setPlaceholderText("Room")
 
 		self.mic_combo = QtWidgets.QComboBox()
+		self.vad_threshold_spin = QtWidgets.QSpinBox()
+		self.vad_threshold_spin.setRange(0, 20000)
+		self.vad_threshold_spin.setSingleStep(50)
+		self.vad_threshold_spin.setToolTip("Audio activity threshold (RMS). Lower = more sensitive")
 		self.speaker_combo = QtWidgets.QComboBox()
 
 		self.connect_btn = QtWidgets.QPushButton("Connect")
@@ -42,7 +46,14 @@ class MainWindow(QtWidgets.QMainWindow):
 		form.addRow("Server", self.server_url_edit)
 		form.addRow("Name", self.name_edit)
 		form.addRow("Room", self.room_edit)
-		form.addRow("Mic", self.mic_combo)
+		mic_row = QtWidgets.QHBoxLayout()
+		mic_row.setContentsMargins(0, 0, 0, 0)
+		mic_row.addWidget(self.mic_combo, 1)
+		mic_row.addWidget(QtWidgets.QLabel("Thr"))
+		mic_row.addWidget(self.vad_threshold_spin)
+		mic_row_widget = QtWidgets.QWidget()
+		mic_row_widget.setLayout(mic_row)
+		form.addRow("Mic", mic_row_widget)
 		form.addRow("Speaker", self.speaker_combo)
 
 		btn_row = QtWidgets.QHBoxLayout()

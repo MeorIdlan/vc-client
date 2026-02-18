@@ -8,11 +8,14 @@ MVP scope:
 from __future__ import annotations
 
 import asyncio
+import array
 import logging
+import os
 import platform
 import shutil
 import subprocess
 import sys
+import time
 from fractions import Fraction
 from queue import Queue
 from dataclasses import dataclass
@@ -34,6 +37,173 @@ except Exception:  # pragma: no cover
 
 
 logger = logging.getLogger(__name__)
+
+
+def _env_int(name: str, default: int) -> int:
+	v = os.environ.get(name)
+	if v is None:
+		return default
+	try:
+		return int(v)
+	except Exception:
+		return default
+
+
+def _env_float(name: str, default: float) -> float:
+	v = os.environ.get(name)
+	if v is None:
+		return default
+	try:
+		return float(v)
+	except Exception:
+		return default
+
+
+@dataclass
+class AudioActivityConfig:
+	"""Configuration for AudioActivityLogTrack.
+
+	Values are on an int16-ish RMS scale (roughly 0..32768).
+	"""
+
+	rms_start: int = 900
+	rms_stop: int = 600
+	log_interval_sec: float = 1.0
+
+	@classmethod
+	def from_env(cls) -> "AudioActivityConfig":
+		return cls(
+			rms_start=int(_env_int("VC_AUDIO_RMS_START", cls.rms_start)),
+			rms_stop=int(_env_int("VC_AUDIO_RMS_STOP", cls.rms_stop)),
+			log_interval_sec=float(_env_float("VC_AUDIO_LOG_INTERVAL_SEC", cls.log_interval_sec)),
+		)
+
+
+class AudioActivityLogTrack(MediaStreamTrack):
+	"""Pass-through audio track that emits debug logs when voice is detected.
+
+	This is meant purely for local testing / debugging.
+
+	Tuning (optional env vars):
+	- VC_AUDIO_RMS_START: int16 RMS threshold to enter "talking" state.
+	- VC_AUDIO_RMS_STOP: int16 RMS threshold to exit "talking" state.
+	- VC_AUDIO_LOG_INTERVAL_SEC: throttle interval for repeated "talking" logs.
+	"""
+
+	kind = "audio"
+
+	def __init__(self, source: MediaStreamTrack, *, label: str, config: Optional[AudioActivityConfig] = None):
+		super().__init__()
+		self._source = source
+		self._label = label
+		self._config = config or AudioActivityConfig.from_env()
+		self._talking = False
+		self._last_log_ts = 0.0
+
+	async def recv(self):  # type: ignore[override]
+		frame = await self._source.recv()
+
+		# Keep overhead near-zero unless debug logging is enabled.
+		if not logger.isEnabledFor(logging.DEBUG):
+			return frame
+
+		if not isinstance(frame, av.AudioFrame):
+			return frame
+
+		rms = self._compute_rms_int16(cast(av.AudioFrame, frame))
+		if rms is None:
+			return frame
+
+		now = time.monotonic()
+		rms_start = int(getattr(self._config, "rms_start", 900))
+		rms_stop = int(getattr(self._config, "rms_stop", 600))
+		log_interval_sec = float(getattr(self._config, "log_interval_sec", 1.0))
+		if not self._talking:
+			if rms >= rms_start:
+				self._talking = True
+				self._last_log_ts = now
+				logger.debug("audio activity %s state=talking rms=%s", self._label, rms)
+		else:
+			if rms <= rms_stop:
+				self._talking = False
+				logger.debug("audio activity %s state=silent rms=%s", self._label, rms)
+			elif (now - self._last_log_ts) >= log_interval_sec:
+				self._last_log_ts = now
+				logger.debug("audio activity %s state=talking rms=%s", self._label, rms)
+
+		return frame
+
+	def stop(self) -> None:  # type: ignore[override]
+		try:
+			stop = getattr(self._source, "stop", None)
+			if callable(stop):
+				stop()
+		except Exception:
+			pass
+		finally:
+			super().stop()
+
+	@staticmethod
+	def _compute_rms_int16(frame: av.AudioFrame) -> Optional[int]:
+		"""Return int16 RMS estimate, or None if unsupported."""
+		try:
+			fmt = str(getattr(frame, "format", "") or "")
+			fmt_name = getattr(getattr(frame, "format", None), "name", None)
+			fmt_s = str(fmt_name or fmt)
+		except Exception:
+			fmt_s = ""
+
+		# Fast path for s16 / s16p using audioop when numpy isn't available.
+		if "s16" in fmt_s and np is None:
+			try:
+				plane0 = frame.planes[0]
+				pcm = bytes(plane0)
+				samples = array.array("h")
+				samples.frombytes(pcm)
+				if not samples:
+					return 0
+				sum_sq = 0.0
+				for s in samples:
+					sum_sq += float(s) * float(s)
+				rms = (sum_sq / float(len(samples))) ** 0.5
+				return int(rms)
+			except Exception:
+				return None
+
+		# Numpy-based path supports more formats, and is usually available when
+		# using sounddevice on Windows.
+		if np is None:
+			return None
+		assert np is not None
+
+		try:
+			arr = frame.to_ndarray()
+			# Common shapes: (channels, samples) for planar, or (samples, channels)
+			if arr.ndim == 2 and arr.shape[0] in (1, 2) and arr.shape[0] < arr.shape[1]:
+				arr = arr.T
+			# Mixdown to mono
+			if arr.ndim == 2:
+				arr = arr.mean(axis=1)
+			arr = arr.astype(np.float32, copy=False)
+			rms = float(np.sqrt(np.mean(arr * arr)))
+			# If source is float, rms may be in [-1,1] scale.
+			if rms <= 2.0:
+				rms *= 32768.0
+			return int(rms)
+		except Exception:
+			return None
+
+
+def wrap_with_audio_activity_log(
+	track: Optional[MediaStreamTrack], *, label: str, config: Optional[AudioActivityConfig] = None
+) -> Optional[MediaStreamTrack]:
+	if track is None:
+		return None
+	try:
+		return AudioActivityLogTrack(track, label=label, config=config)
+	except Exception:
+		# Never break call setup due to debug-only logging.
+		return track
 
 
 @dataclass(frozen=True)
@@ -304,7 +474,12 @@ class LocalAudio:
 	backend: Optional[str] = None
 
 	@classmethod
-	def create(cls, preferred_input: Optional[AudioDevice] = None) -> "LocalAudio":
+	def create(
+		cls,
+		preferred_input: Optional[AudioDevice] = None,
+		*,
+		activity_config: Optional[AudioActivityConfig] = None,
+	) -> "LocalAudio":
 		# Windows-first: capture via sounddevice to get real device switching.
 		if _is_windows() and sd is not None and np is not None:
 			device = None
@@ -313,6 +488,10 @@ class LocalAudio:
 					device = preferred_input.device
 			try:
 				track = SoundDeviceAudioTrack(device=device)
+				track = cast(
+					MediaStreamTrack,
+					wrap_with_audio_activity_log(track, label="TX backend=sounddevice", config=activity_config) or track,
+				)
 				logger.info("local audio backend=sounddevice track=%s", bool(track))
 				return cls(player=None, track=track, backend="sounddevice")
 			except Exception as e:
@@ -320,6 +499,7 @@ class LocalAudio:
 
 		player, backend = _try_create_player(preferred_input)
 		track = player.audio if player else None
+		track = wrap_with_audio_activity_log(track, label=f"TX backend={backend or 'unknown'}", config=activity_config)
 		logger.info("local audio backend=%s track=%s", backend, bool(track))
 		return cls(player=player, track=track, backend=backend)
 

@@ -82,6 +82,7 @@ class VCClientApp(QtCore.QObject):
 
         self._selected_input: Optional[AudioDevice] = None
         self._selected_output: Optional[AudioDevice] = None
+        self._audio_rms_start: int = 900
 
         self.peer_manager = PeerManager(
             callbacks=ManagerCallbacks(
@@ -89,6 +90,8 @@ class VCClientApp(QtCore.QObject):
                 on_peer_state=self._on_peer_state,
             )
         )
+
+        self._audio_rms_start = int(self.peer_manager.audio_activity_config.rms_start)
 
         self.signaling = SignalingClient(
             url=self.cfg.server_url,
@@ -111,6 +114,13 @@ class VCClientApp(QtCore.QObject):
         self._wire_bridge()
         self._init_audio_device_selectors()
 
+        # Initialize threshold knob (before start so the value is visible).
+        try:
+            self.window.vad_threshold_spin.blockSignals(True)
+            self.window.vad_threshold_spin.setValue(self._audio_rms_start)
+        finally:
+            self.window.vad_threshold_spin.blockSignals(False)
+
         # Defaults
         self.window.server_url_edit.setText(cfg.server_url)
         self.window.room_edit.setText(cfg.room)
@@ -119,6 +129,7 @@ class VCClientApp(QtCore.QObject):
     def start(self) -> None:
         self.asyncio_thread.start()
         self._apply_audio_device_selection()
+        self._apply_audio_activity_threshold()
         self.window.show()
         self.bridge.status.emit("Ready")
         logger.info("ui started")
@@ -140,6 +151,7 @@ class VCClientApp(QtCore.QObject):
 
         self.window.mic_combo.currentIndexChanged.connect(self._on_audio_device_changed)
         self.window.speaker_combo.currentIndexChanged.connect(self._on_audio_device_changed)
+        self.window.vad_threshold_spin.valueChanged.connect(self._on_vad_threshold_changed)
 
     def _init_audio_device_selectors(self) -> None:
         """Populate device dropdowns (best-effort)."""
@@ -185,10 +197,20 @@ class VCClientApp(QtCore.QObject):
             self.peer_manager.set_audio_devices(input_device=self._selected_input, output_device=self._selected_output)
         )
 
+    def _apply_audio_activity_threshold(self) -> None:
+        if not getattr(self.asyncio_thread, "_loop", None):
+            return
+        self.asyncio_thread.submit(self.peer_manager.set_audio_activity_threshold(self._audio_rms_start))
+
     @QtCore.Slot(int)
     def _on_audio_device_changed(self, _index: int) -> None:
         self._selected_input, self._selected_output = self._get_selected_devices()
         self._apply_audio_device_selection()
+
+    @QtCore.Slot(int)
+    def _on_vad_threshold_changed(self, value: int) -> None:
+        self._audio_rms_start = int(value)
+        self._apply_audio_activity_threshold()
 
     def _wire_bridge(self) -> None:
         self.bridge.log.connect(self.window.log_panel.append_log)
