@@ -345,7 +345,14 @@ def _run_cmd_lines(argv: list[str], timeout_sec: float = 0.8) -> list[str]:
 		return []
 	if not p.stdout:
 		return []
-	return [ln.strip() for ln in p.stdout.splitlines() if ln.strip()]
+	# Preserve leading whitespace so callers can distinguish indented
+	# commentary lines (e.g. `arecord -L` / `aplay -L`).
+	lines: list[str] = []
+	for ln in p.stdout.splitlines():
+		if not ln.strip():
+			continue
+		lines.append(ln.rstrip("\r\n"))
+	return lines
 
 
 def _pactl_default(kind: str) -> Optional[str]:
@@ -359,6 +366,28 @@ def _pactl_default(kind: str) -> Optional[str]:
 			value = ln[len(prefix) :].strip()
 			return value or None
 	return None
+
+
+def _dedupe_audio_devices(devices: list[AudioDevice]) -> list[AudioDevice]:
+	"""Return devices with duplicates removed, preserving order.
+
+	On Windows, PortAudio may expose the same physical device multiple times under
+	different host APIs (MME/WASAPI/WDM-KS), often with identical names.
+	"""
+	seen: set[tuple[str, str]] = set()
+	result: list[AudioDevice] = []
+	for d in devices:
+		# Prefer a conservative key on Linux backends, but for sounddevice we
+		# dedupe by label to collapse multi-host-api duplicates.
+		if d.backend == "sounddevice":
+			key = (d.backend, str(d.label).strip().casefold())
+		else:
+			key = (d.backend, str(d.device))
+		if key in seen:
+			continue
+		seen.add(key)
+		result.append(d)
+	return result
 
 
 def list_audio_inputs() -> list[AudioDevice]:
@@ -377,7 +406,7 @@ def list_audio_inputs() -> list[AudioDevice]:
 					continue
 				name = str(dev.get("name", f"Device {idx}"))
 				devices.append(AudioDevice(backend="sounddevice", device=idx, label=name))
-			return devices
+				return _dedupe_audio_devices(devices)
 		except Exception:
 			# Fall through to linux probing.
 			pass
@@ -408,7 +437,7 @@ def list_audio_inputs() -> list[AudioDevice]:
 	# Always allow "default" as a safe option.
 	if not any(d.backend == "pulse" and d.device == "default" for d in devices):
 		devices.insert(0, AudioDevice(backend="pulse", device="default", label="System default"))
-	return devices
+	return _dedupe_audio_devices(devices)
 
 
 def list_audio_outputs() -> list[AudioDevice]:
@@ -426,7 +455,7 @@ def list_audio_outputs() -> list[AudioDevice]:
 					continue
 				name = str(dev.get("name", f"Device {idx}"))
 				devices.append(AudioDevice(backend="sounddevice", device=idx, label=name))
-			return devices
+				return _dedupe_audio_devices(devices)
 		except Exception:
 			pass
 
@@ -452,7 +481,7 @@ def list_audio_outputs() -> list[AudioDevice]:
 
 	if not any(d.backend == "pulse" and d.device == "default" for d in devices):
 		devices.insert(0, AudioDevice(backend="pulse", device="default", label="System default"))
-	return devices
+	return _dedupe_audio_devices(devices)
 
 
 def _try_create_player(preferred: Optional[AudioDevice] = None) -> Tuple[Optional[MediaPlayer], Optional[str]]:
