@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, Optional, cast
+from typing import Any, Awaitable, Callable, Coroutine, Dict, Optional, cast
 
 from aiortc.rtcconfiguration import RTCConfiguration
 
@@ -19,12 +19,15 @@ logger = logging.getLogger(__name__)
 
 
 AsyncCallback = Callable[..., Awaitable[None]]
+AsyncAudioActivityCallback = Callable[[bool, int, str], Coroutine[Any, Any, None]]
 
 
 @dataclass
 class ManagerCallbacks:
     on_log: Optional[AsyncCallback] = None
     on_peer_state: Optional[AsyncCallback] = None  # (peer_id: str, state: str)
+    # (talking: bool, rms: int, label: str)
+    on_local_audio_activity: Optional[AsyncAudioActivityCallback] = None
 
 
 class PeerManager:
@@ -38,7 +41,11 @@ class PeerManager:
         self._preferred_input: Optional[AudioDevice] = None
         self._preferred_output: Optional[AudioDevice] = None
         self._audio_activity_config = AudioActivityConfig.from_env()
-        self._local_audio = LocalAudio.create(self._preferred_input, activity_config=self._audio_activity_config)
+        self._local_audio = LocalAudio.create(
+            self._preferred_input,
+            activity_config=self._audio_activity_config,
+            on_activity=self._emit_local_audio_activity,
+        )
         self._rtc_config: Optional[RTCConfiguration] = None
 
         self._lock = asyncio.Lock()
@@ -75,7 +82,11 @@ class PeerManager:
             self._preferred_output = output_device
 
             old = self._local_audio
-            self._local_audio = LocalAudio.create(self._preferred_input, activity_config=self._audio_activity_config)
+            self._local_audio = LocalAudio.create(
+                self._preferred_input,
+                activity_config=self._audio_activity_config,
+                on_activity=self._emit_local_audio_activity,
+            )
 
         try:
             old.close()
@@ -206,3 +217,12 @@ class PeerManager:
     async def _log(self, message: str) -> None:
         if self._callbacks.on_log:
             await self._callbacks.on_log(message)
+
+    def _emit_local_audio_activity(self, talking: bool, rms: int, label: str) -> None:
+        cb = self._callbacks.on_local_audio_activity
+        if cb is None:
+            return
+        try:
+            asyncio.create_task(cb(bool(talking), int(rms), str(label)))
+        except Exception:
+            pass

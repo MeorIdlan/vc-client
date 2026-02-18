@@ -60,6 +60,9 @@ class UiBridge(QtCore.QObject):
     log = QtCore.Signal(str)
     status = QtCore.Signal(str)
     peers_changed = QtCore.Signal(list)  # list[str]
+    connection_state = QtCore.Signal(str)
+    room_state = QtCore.Signal(str)
+    talking = QtCore.Signal(bool)
 
 
 @dataclass
@@ -88,6 +91,7 @@ class VCClientApp(QtCore.QObject):
             callbacks=ManagerCallbacks(
                 on_log=self._on_async_log,
                 on_peer_state=self._on_peer_state,
+                on_local_audio_activity=self._on_local_audio_activity,
             )
         )
 
@@ -132,6 +136,9 @@ class VCClientApp(QtCore.QObject):
         self._apply_audio_activity_threshold()
         self.window.show()
         self.bridge.status.emit("Ready")
+        self.bridge.connection_state.emit("Disconnected")
+        self.bridge.room_state.emit("")
+        self.bridge.talking.emit(False)
         logger.info("ui started")
 
     def shutdown(self) -> None:
@@ -216,17 +223,24 @@ class VCClientApp(QtCore.QObject):
         self.bridge.log.connect(self.window.log_panel.append_log)
         self.bridge.status.connect(self.window.set_status)
         self.bridge.peers_changed.connect(self._update_peer_list)
+        self.bridge.connection_state.connect(self.window.status_card.set_connection_state)
+        self.bridge.room_state.connect(self.window.status_card.set_room)
+        self.bridge.talking.connect(self.window.status_card.set_talking)
 
     @QtCore.Slot()
     def _on_connect_clicked(self) -> None:
         self.signaling.url = self.window.server_url_edit.text().strip()
         self.bridge.status.emit("Connecting...")
+        self.bridge.connection_state.emit("Connecting")
         logger.info("ui connect clicked url=%s", self.signaling.url)
         self.asyncio_thread.submit(self.signaling.connect())
 
     @QtCore.Slot()
     def _on_disconnect_clicked(self) -> None:
         self.bridge.status.emit("Disconnecting...")
+        self.bridge.connection_state.emit("Disconnecting")
+        self.bridge.room_state.emit("")
+        self.bridge.talking.emit(False)
         logger.info("ui disconnect clicked")
         self.asyncio_thread.submit(self.peer_manager.leave_room())
         self.asyncio_thread.submit(self.signaling.disconnect())
@@ -245,6 +259,8 @@ class VCClientApp(QtCore.QObject):
     @QtCore.Slot()
     def _on_leave_clicked(self) -> None:
         self.bridge.status.emit("Leaving...")
+        self.bridge.room_state.emit("")
+        self.bridge.talking.emit(False)
         logger.info("ui leave clicked")
         self.asyncio_thread.submit(self.peer_manager.leave_room())
         self.asyncio_thread.submit(self.signaling.leave())
@@ -267,15 +283,19 @@ class VCClientApp(QtCore.QObject):
     async def _on_welcome(self, peer_id: str) -> None:
         self.peer_manager.set_self_id(peer_id)
         self.bridge.status.emit(f"Connected as {peer_id}")
+        self.bridge.connection_state.emit("Connected")
 
     async def _on_joined(self, room: str, peers: list[dict]) -> None:
         self.bridge.log.emit(f"Joined room {room}")
+        self.bridge.room_state.emit(room)
         self._roster = {str(p.get('peer_id')): self._fmt_peer(p) for p in peers if p.get('peer_id')}
         await self.peer_manager.join_room(room, peers)
         self.bridge.peers_changed.emit(list(self._roster.values()))
 
     async def _on_left(self, room: str) -> None:
         self.bridge.log.emit(f"Left room {room}")
+        self.bridge.room_state.emit("")
+        self.bridge.talking.emit(False)
         self._roster.clear()
         await self.peer_manager.leave_room()
         self.bridge.peers_changed.emit([])
@@ -306,6 +326,16 @@ class VCClientApp(QtCore.QObject):
     async def _on_error(self, error: str, payload: dict) -> None:
         self.bridge.log.emit(f"Error: {error} {payload}")
         self.bridge.status.emit(f"Error: {error}")
+        if error in ("connect-failed", "recv-loop-exception"):
+            self.bridge.connection_state.emit("Disconnected")
+            self.bridge.room_state.emit("")
+            self.bridge.talking.emit(False)
+
+    async def _on_local_audio_activity(self, talking: bool, rms: int, label: str) -> None:
+        # Only show local microphone activity (TX) in the status card.
+        if not str(label).startswith("TX"):
+            return
+        self.bridge.talking.emit(bool(talking))
 
     def _fmt_peer(self, peer: dict) -> str:
         pid = str(peer.get("peer_id", ""))

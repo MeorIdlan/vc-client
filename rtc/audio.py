@@ -19,7 +19,7 @@ import time
 from fractions import Fraction
 from queue import Queue
 from dataclasses import dataclass
-from typing import Any, Optional, Tuple, cast
+from typing import Any, Callable, Optional, Tuple, cast
 
 import av
 from aiortc import MediaStreamTrack
@@ -92,19 +92,27 @@ class AudioActivityLogTrack(MediaStreamTrack):
 
 	kind = "audio"
 
-	def __init__(self, source: MediaStreamTrack, *, label: str, config: Optional[AudioActivityConfig] = None):
+	def __init__(
+		self,
+		source: MediaStreamTrack,
+		*,
+		label: str,
+		config: Optional[AudioActivityConfig] = None,
+		on_activity: Optional[Callable[[bool, int, str], None]] = None,
+	):
 		super().__init__()
 		self._source = source
 		self._label = label
 		self._config = config or AudioActivityConfig.from_env()
 		self._talking = False
 		self._last_log_ts = 0.0
+		self._on_activity = on_activity
 
 	async def recv(self):  # type: ignore[override]
 		frame = await self._source.recv()
 
-		# Keep overhead near-zero unless debug logging is enabled.
-		if not logger.isEnabledFor(logging.DEBUG):
+		# Keep overhead near-zero unless we are logging or a caller wants activity events.
+		if not logger.isEnabledFor(logging.DEBUG) and self._on_activity is None:
 			return frame
 
 		if not isinstance(frame, av.AudioFrame):
@@ -118,6 +126,7 @@ class AudioActivityLogTrack(MediaStreamTrack):
 		rms_start = int(getattr(self._config, "rms_start", 900))
 		rms_stop = int(getattr(self._config, "rms_stop", 600))
 		log_interval_sec = float(getattr(self._config, "log_interval_sec", 1.0))
+		prev_talking = self._talking
 		if not self._talking:
 			if rms >= rms_start:
 				self._talking = True
@@ -130,6 +139,13 @@ class AudioActivityLogTrack(MediaStreamTrack):
 			elif (now - self._last_log_ts) >= log_interval_sec:
 				self._last_log_ts = now
 				logger.debug("audio activity %s state=talking rms=%s", self._label, rms)
+
+		if self._on_activity is not None and self._talking != prev_talking:
+			try:
+				self._on_activity(self._talking, int(rms), self._label)
+			except Exception:
+				# Never break media pipeline due to UI/debug callbacks.
+				pass
 
 		return frame
 
@@ -195,12 +211,16 @@ class AudioActivityLogTrack(MediaStreamTrack):
 
 
 def wrap_with_audio_activity_log(
-	track: Optional[MediaStreamTrack], *, label: str, config: Optional[AudioActivityConfig] = None
+	track: Optional[MediaStreamTrack],
+	*,
+	label: str,
+	config: Optional[AudioActivityConfig] = None,
+	on_activity: Optional[Callable[[bool, int, str], None]] = None,
 ) -> Optional[MediaStreamTrack]:
 	if track is None:
 		return None
 	try:
-		return AudioActivityLogTrack(track, label=label, config=config)
+		return AudioActivityLogTrack(track, label=label, config=config, on_activity=on_activity)
 	except Exception:
 		# Never break call setup due to debug-only logging.
 		return track
@@ -479,6 +499,7 @@ class LocalAudio:
 		preferred_input: Optional[AudioDevice] = None,
 		*,
 		activity_config: Optional[AudioActivityConfig] = None,
+		on_activity: Optional[Callable[[bool, int, str], None]] = None,
 	) -> "LocalAudio":
 		# Windows-first: capture via sounddevice to get real device switching.
 		if _is_windows() and sd is not None and np is not None:
@@ -490,7 +511,13 @@ class LocalAudio:
 				track = SoundDeviceAudioTrack(device=device)
 				track = cast(
 					MediaStreamTrack,
-					wrap_with_audio_activity_log(track, label="TX backend=sounddevice", config=activity_config) or track,
+					wrap_with_audio_activity_log(
+						track,
+						label="TX backend=sounddevice",
+						config=activity_config,
+						on_activity=on_activity,
+					)
+					or track,
 				)
 				logger.info("local audio backend=sounddevice track=%s", bool(track))
 				return cls(player=None, track=track, backend="sounddevice")
@@ -499,7 +526,12 @@ class LocalAudio:
 
 		player, backend = _try_create_player(preferred_input)
 		track = player.audio if player else None
-		track = wrap_with_audio_activity_log(track, label=f"TX backend={backend or 'unknown'}", config=activity_config)
+		track = wrap_with_audio_activity_log(
+			track,
+			label=f"TX backend={backend or 'unknown'}",
+			config=activity_config,
+			on_activity=on_activity,
+		)
 		logger.info("local audio backend=%s track=%s", backend, bool(track))
 		return cls(player=player, track=track, backend=backend)
 

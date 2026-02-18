@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from PySide6 import QtCore, QtWidgets
 
-from .widgets import LogPanel, PeerList
+from .widgets import LogPanel, PeerList, StatusCard
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -41,6 +41,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
 		self.peer_list = PeerList()
 		self.log_panel = LogPanel()
+		self.status_card = StatusCard()
 
 		form = QtWidgets.QFormLayout()
 		form.addRow("Server", self.server_url_edit)
@@ -72,6 +73,7 @@ class MainWindow(QtWidgets.QMainWindow):
 		right = QtWidgets.QVBoxLayout()
 		right.addWidget(QtWidgets.QLabel("Log"))
 		right.addWidget(self.log_panel, 1)
+		right.addWidget(self.status_card, 0)
 
 		main = QtWidgets.QHBoxLayout(central)
 		main.addLayout(left, 1)
