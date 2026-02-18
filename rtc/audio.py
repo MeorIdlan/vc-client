@@ -426,7 +426,7 @@ def list_audio_inputs() -> list[AudioDevice]:
 				if _is_redundant_windows_audio_device_name(name):
 					continue
 				devices.append(AudioDevice(backend="sounddevice", device=idx, label=name))
-				return _dedupe_audio_devices(devices)
+			return _dedupe_audio_devices(devices)
 		except Exception:
 			# Fall through to linux probing.
 			pass
@@ -477,7 +477,7 @@ def list_audio_outputs() -> list[AudioDevice]:
 				if _is_redundant_windows_audio_device_name(name):
 					continue
 				devices.append(AudioDevice(backend="sounddevice", device=idx, label=name))
-				return _dedupe_audio_devices(devices)
+			return _dedupe_audio_devices(devices)
 		except Exception:
 			pass
 
