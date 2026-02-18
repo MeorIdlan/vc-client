@@ -12,6 +12,7 @@ import array
 import logging
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -262,6 +263,109 @@ def _is_redundant_windows_audio_device_name(name: str) -> bool:
 	)
 
 
+_SD_HOSTAPI_SUFFIX_RE = re.compile(
+	r"\s*(?:\(|,|-)\s*(wasapi|mme|directsound|wdm-ks|wdm ks)\s*\)?\s*$",
+	re.IGNORECASE,
+)
+
+
+def _normalize_sounddevice_name(name: str) -> str:
+	"""Normalize a sounddevice/PortAudio name for duplicate-collapsing.
+
+	Some PortAudio builds include host API markers in the device name, which can
+	get truncated in the UI and appear as duplicates.
+	"""
+	base = (name or "").strip()
+	base = _SD_HOSTAPI_SUFFIX_RE.sub("", base).strip()
+	return base
+
+
+def _hostapi_preference_rank(hostapi_name: str) -> int:
+	"""Lower is better."""
+	n = (hostapi_name or "").strip().casefold()
+	order = ["wasapi", "wdm-ks", "wdm ks", "directsound", "mme"]
+	for i, token in enumerate(order):
+		if token in n:
+			return i
+	return 999
+
+
+def _list_sounddevice_devices(*, want: str) -> list[AudioDevice]:
+	"""Enumerate Windows devices via sounddevice, collapsing host-API duplicates.
+
+	`want` is "input" or "output".
+	"""
+	if sd is None:
+		return []
+
+	try:
+		hostapis = sd.query_hostapis()  # type: ignore[attr-defined]
+		hostapi_names = {i: str(h.get("name", "")) for i, h in enumerate(hostapis)}
+	except Exception:
+		hostapi_names = {}
+
+	try:
+		raw = list(sd.query_devices())
+	except Exception:
+		return []
+
+	# Collect candidates (base_name -> list of (rank, idx, label))
+	groups: dict[str, list[tuple[int, int, str]]] = {}
+	for idx, dev in enumerate(raw):
+		try:
+			max_in = int(dev.get("max_input_channels", 0))
+			max_out = int(dev.get("max_output_channels", 0))
+		except Exception:
+			continue
+		if want == "input" and max_in <= 0:
+			continue
+		if want == "output" and max_out <= 0:
+			continue
+
+		name = str(dev.get("name", f"Device {idx}"))
+		if _is_redundant_windows_audio_device_name(name):
+			continue
+
+		base = _normalize_sounddevice_name(name)
+		if not base:
+			continue
+
+		hostapi_idx = dev.get("hostapi", None)
+		if hostapi_idx is None:
+			hostapi_name = ""
+		else:
+			try:
+				hostapi_name = str(hostapi_names.get(int(hostapi_idx), ""))
+			except Exception:
+				hostapi_name = ""
+		rank = _hostapi_preference_rank(hostapi_name)
+		groups.setdefault(base, []).append((rank, idx, name))
+
+	# Pick best host API per base name
+	selected: list[tuple[str, int, str]] = []
+	for base, items in groups.items():
+		items_sorted = sorted(items, key=lambda t: (t[0], t[1]))
+		best_rank = items_sorted[0][0]
+		# Keep only items from the best host API rank for this name.
+		best = [(idx, label) for (rank, idx, label) in items_sorted if rank == best_rank]
+		for idx, label in best:
+			selected.append((base, idx, label))
+
+	# If multiple selected share same base name, disambiguate label.
+	base_counts: dict[str, int] = {}
+	for base, _idx, _label in selected:
+		base_counts[base] = base_counts.get(base, 0) + 1
+
+	devices: list[AudioDevice] = [AudioDevice(backend="sounddevice", device="default", label="System default")]
+	for base, idx, label in sorted(selected, key=lambda t: t[1]):
+		final_label = label
+		if base_counts.get(base, 0) > 1:
+			final_label = f"{base} (id {idx})"
+		devices.append(AudioDevice(backend="sounddevice", device=idx, label=final_label))
+
+	return devices
+
+
 class SoundDeviceAudioTrack(MediaStreamTrack):
 	kind = "audio"
 
@@ -395,12 +499,9 @@ def _dedupe_audio_devices(devices: list[AudioDevice]) -> list[AudioDevice]:
 	seen: set[tuple[str, str]] = set()
 	result: list[AudioDevice] = []
 	for d in devices:
-		# Prefer a conservative key on Linux backends, but for sounddevice we
-		# dedupe by label to collapse multi-host-api duplicates.
-		if d.backend == "sounddevice":
-			key = (d.backend, str(d.label).strip().casefold())
-		else:
-			key = (d.backend, str(d.device))
+		# Dedupe by backend+device id; Windows sounddevice duplicates are handled
+		# during enumeration (host API preference).
+		key = (d.backend, str(d.device))
 		if key in seen:
 			continue
 		seen.add(key)
@@ -415,18 +516,7 @@ def list_audio_inputs() -> list[AudioDevice]:
 	# Windows-first: PortAudio device list
 	if _is_windows() and sd is not None:
 		try:
-			devices.append(AudioDevice(backend="sounddevice", device="default", label="System default"))
-			for idx, dev in enumerate(sd.query_devices()):
-				try:
-					if int(dev.get("max_input_channels", 0)) <= 0:
-						continue
-				except Exception:
-					continue
-				name = str(dev.get("name", f"Device {idx}"))
-				if _is_redundant_windows_audio_device_name(name):
-					continue
-				devices.append(AudioDevice(backend="sounddevice", device=idx, label=name))
-			return _dedupe_audio_devices(devices)
+			return _dedupe_audio_devices(_list_sounddevice_devices(want="input"))
 		except Exception:
 			# Fall through to linux probing.
 			pass
@@ -466,18 +556,7 @@ def list_audio_outputs() -> list[AudioDevice]:
 
 	if _is_windows() and sd is not None:
 		try:
-			devices.append(AudioDevice(backend="sounddevice", device="default", label="System default"))
-			for idx, dev in enumerate(sd.query_devices()):
-				try:
-					if int(dev.get("max_output_channels", 0)) <= 0:
-						continue
-				except Exception:
-					continue
-				name = str(dev.get("name", f"Device {idx}"))
-				if _is_redundant_windows_audio_device_name(name):
-					continue
-				devices.append(AudioDevice(backend="sounddevice", device=idx, label=name))
-			return _dedupe_audio_devices(devices)
+			return _dedupe_audio_devices(_list_sounddevice_devices(want="output"))
 		except Exception:
 			pass
 
